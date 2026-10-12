@@ -24,7 +24,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::stats::{RequestRecord, Stats};
+use crate::{
+    energy::{Activity, EnergySource, Phase, PhaseGuard},
+    stats::{RequestRecord, Stats},
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -32,11 +35,36 @@ pub struct AppState {
     pub upstream: String,
     pub stats: Stats,
     pub next_id: Arc<AtomicU64>,
+    pub energy: Arc<dyn EnergySource>,
+    pub activity: Arc<Activity>,
+}
+
+/// Energy-counter reading taken when a request starts.
+struct EnergyStart {
+    source: Arc<dyn EnergySource>,
+    start_mj: u64,
+}
+
+impl EnergyStart {
+    fn new(source: Arc<dyn EnergySource>) -> Self {
+        let start_mj = source.total_energy_mj();
+        Self { source, start_mj }
+    }
+
+    /// Joules used by the *whole GPU* since this request started.
+    ///
+    /// This is the naive measurement: it also includes idle power and any
+    /// other requests running at the same time. Splitting energy fairly
+    /// between concurrent requests is the next step.
+    fn joules_so_far(&self) -> f64 {
+        self.source.total_energy_mj().saturating_sub(self.start_mj) as f64 / 1000.0
+    }
 }
 
 pub async fn chat_completions(State(state): State<AppState>, Json(mut body): Json<Value>) -> Response {
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let start = Instant::now();
+    let energy = EnergyStart::new(state.energy.clone());
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     // Ask the server to report exact token usage at the end of the stream.
@@ -61,9 +89,13 @@ pub async fn chat_completions(State(state): State<AppState>, Json(mut body): Jso
         .unwrap_or(HeaderValue::from_static("application/json"));
 
     let response_body = if stream && status.is_success() {
-        stream_and_measure(upstream, id, start, state.stats)
+        // Streaming: we see the first token, so we know when prefill ends.
+        let phase = PhaseGuard::new(state.activity.clone(), Phase::Prefill);
+        stream_and_measure(upstream, id, start, energy, phase, state.stats)
     } else {
-        buffer_and_measure(upstream, id, start, stream, status, state.stats).await
+        // Non-streaming: we can't see phases, so count it all as decode.
+        let _phase = PhaseGuard::new(state.activity.clone(), Phase::Decode);
+        buffer_and_measure(upstream, id, start, energy, stream, status, state.stats).await
     };
 
     let mut response = Response::new(response_body);
@@ -80,6 +112,7 @@ async fn buffer_and_measure(
     upstream: reqwest::Response,
     id: u64,
     start: Instant,
+    energy: EnergyStart,
     stream: bool,
     status: StatusCode,
     stats: Stats,
@@ -88,11 +121,15 @@ async fn buffer_and_measure(
     if status.is_success() {
         let usage = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("usage").cloned());
         let get = |key: &str| usage.as_ref().and_then(|u| u.get(key)).and_then(Value::as_u64);
+        let completion_tokens = get("completion_tokens").unwrap_or(0);
+        let energy_j = energy.joules_so_far();
         stats.push(RequestRecord {
             id,
             stream,
             prompt_tokens: get("prompt_tokens"),
-            completion_tokens: get("completion_tokens").unwrap_or(0),
+            completion_tokens,
+            energy_j,
+            joules_per_token: per_token(energy_j, completion_tokens),
             ttft_ms: None,
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
             decode_tokens_per_s: None,
@@ -103,8 +140,15 @@ async fn buffer_and_measure(
 }
 
 /// Streaming: pass each chunk straight through while a `Tracker` watches it.
-fn stream_and_measure(upstream: reqwest::Response, id: u64, start: Instant, stats: Stats) -> Body {
-    let tracker = Arc::new(Mutex::new(Tracker::new(id, start, stats)));
+fn stream_and_measure(
+    upstream: reqwest::Response,
+    id: u64,
+    start: Instant,
+    energy: EnergyStart,
+    phase: PhaseGuard,
+    stats: Stats,
+) -> Body {
+    let tracker = Arc::new(Mutex::new(Tracker::new(id, start, energy, phase, stats)));
     let chunks = upstream.bytes_stream().map(move |chunk| {
         if let Ok(bytes) = &chunk {
             tracker.lock().unwrap().observe(bytes);
@@ -120,6 +164,8 @@ fn stream_and_measure(upstream: reqwest::Response, id: u64, start: Instant, stat
 struct Tracker {
     id: u64,
     start: Instant,
+    energy: EnergyStart,
+    phase: PhaseGuard,
     stats: Stats,
     /// Holds a partial line when an SSE event is split across network chunks.
     buffer: String,
@@ -132,10 +178,12 @@ struct Tracker {
 }
 
 impl Tracker {
-    fn new(id: u64, start: Instant, stats: Stats) -> Self {
+    fn new(id: u64, start: Instant, energy: EnergyStart, phase: PhaseGuard, stats: Stats) -> Self {
         Self {
             id,
             start,
+            energy,
+            phase,
             stats,
             buffer: String::new(),
             counted_tokens: 0,
@@ -177,7 +225,11 @@ impl Tracker {
             .is_some_and(|s| !s.is_empty());
         if has_text {
             let now = Instant::now();
-            self.first_token_at.get_or_insert(now);
+            if self.first_token_at.is_none() {
+                // First token out: prefill is over, decode begins.
+                self.first_token_at = Some(now);
+                self.phase.enter(Phase::Decode);
+            }
             self.last_token_at = Some(now);
             self.counted_tokens += 1;
         }
@@ -193,15 +245,22 @@ impl Drop for Tracker {
             }
             _ => None,
         };
+        let energy_j = self.energy.joules_so_far();
         self.stats.push(RequestRecord {
             id: self.id,
             stream: true,
             prompt_tokens: self.usage_prompt,
             completion_tokens: tokens,
+            energy_j,
+            joules_per_token: per_token(energy_j, tokens),
             ttft_ms: self.first_token_at.map(|t| (t - self.start).as_secs_f64() * 1000.0),
             total_ms: self.start.elapsed().as_secs_f64() * 1000.0,
             decode_tokens_per_s,
             completed: self.done,
         });
     }
+}
+
+fn per_token(energy_j: f64, tokens: u64) -> Option<f64> {
+    (tokens > 0).then(|| energy_j / tokens as f64)
 }
