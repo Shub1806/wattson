@@ -10,7 +10,8 @@
 //! Configuration (environment variables):
 //!   WATTSON_PORT       port to listen on            (default 8080)
 //!   WATTSON_UPSTREAM   inference server base URL    (default http://127.0.0.1:8000)
-//!   WATTSON_ENERGY     energy source: "sim"         (default sim; "nvml" comes later)
+//!   WATTSON_ENERGY     energy source: "sim" or "nvml"  (default sim)
+//!   WATTSON_GPU_INDEX  which GPU to read with nvml     (default 0)
 
 mod attribution;
 mod energy;
@@ -37,6 +38,10 @@ use stats::{Stats, Summary};
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn requests_handler(State(state): State<AppState>) -> Json<Vec<stats::RequestRecord>> {
+    Json(state.stats.all())
 }
 
 async fn stats_handler(State(state): State<AppState>) -> Json<Summary> {
@@ -76,7 +81,26 @@ async fn main() {
     let activity = Arc::new(Activity::default());
     let energy: Arc<dyn EnergySource> = match env::var("WATTSON_ENERGY").as_deref() {
         Ok("sim") | Err(_) => SimulatedGpu::start(activity.clone()),
-        Ok(other) => panic!("unknown WATTSON_ENERGY={other:?} (supported: sim)"),
+        #[cfg(target_os = "linux")]
+        Ok("nvml") => {
+            let index = env::var("WATTSON_GPU_INDEX").ok().and_then(|i| i.parse().ok()).unwrap_or(0);
+            match energy::NvmlGpu::start(index) {
+                Ok(gpu) => gpu,
+                Err(err) => {
+                    eprintln!("error: {err}\nhint: use WATTSON_ENERGY=sim on machines without an NVIDIA GPU");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok("nvml") => {
+            eprintln!("error: WATTSON_ENERGY=nvml needs Linux with an NVIDIA GPU (e.g. Kaggle); use sim here");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("error: unknown WATTSON_ENERGY={other:?} (use \"sim\" or \"nvml\")");
+            std::process::exit(1);
+        }
     };
 
     let ledger = Ledger::start(energy.clone());
@@ -95,6 +119,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
         .route("/energy", get(energy_handler))
+        .route("/requests", get(requests_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .with_state(state);
 

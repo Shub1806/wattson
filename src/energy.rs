@@ -5,7 +5,7 @@
 //!
 //!   - `SimulatedGpu` (this step): runs anywhere, including a Mac. It fakes
 //!     a T4-like GPU whose power depends on what the gateway is doing.
-//!   - `NvmlGpu` (later, on Kaggle): reads the real NVIDIA energy counter.
+//!   - `NvmlGpu`: reads a real NVIDIA GPU through NVML (e.g. on Kaggle).
 //!
 //! Units follow NVML: energy in millijoules (mJ), power in milliwatts (mW).
 
@@ -164,5 +164,98 @@ impl EnergySource for SimulatedGpu {
 
     fn power_mw(&self) -> u64 {
         (self.power_w() * 1000.0) as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NvmlGpu: real NVIDIA readings
+// ---------------------------------------------------------------------------
+
+/// Reads a real NVIDIA GPU through NVML, the library behind `nvidia-smi`.
+///
+/// Two ways to get energy, picked automatically at startup:
+///
+/// - **Energy counter** (Volta and newer, e.g. T4, A100): the GPU keeps its
+///   own running total in millijoules. Most accurate; we just read it.
+/// - **Power integration** (older GPUs, e.g. P100): no counter, so we sample
+///   power every 20 ms and add up power × time ourselves.
+///
+/// Caveat for the write-up: NVML power readings are averaged by the driver
+/// over a short window, so very short requests are measured less precisely
+/// than long ones.
+#[cfg(target_os = "linux")]
+pub struct NvmlGpu {
+    nvml: nvml_wrapper::Nvml,
+    index: u32,
+    label: String,
+    /// `Some` when using power integration; holds the running total in mJ.
+    integrated_mj: Option<Mutex<f64>>,
+}
+
+#[cfg(target_os = "linux")]
+impl NvmlGpu {
+    pub fn start(index: u32) -> Result<Arc<Self>, String> {
+        let nvml = nvml_wrapper::Nvml::init().map_err(|e| {
+            format!("could not load NVML ({e}). Is this a machine with an NVIDIA GPU and driver?")
+        })?;
+        let device = nvml
+            .device_by_index(index)
+            .map_err(|e| format!("could not open GPU {index}: {e}"))?;
+        let gpu_name = device.name().unwrap_or_else(|_| "unknown GPU".into());
+        let has_counter = device.total_energy_consumption().is_ok();
+        let mode = if has_counter { "energy counter" } else { "power integration" };
+        let label = format!("nvml: {gpu_name} #{index}, {mode}");
+        drop(device);
+
+        let gpu = Arc::new(Self {
+            nvml,
+            index,
+            label,
+            integrated_mj: (!has_counter).then(|| Mutex::new(0.0)),
+        });
+
+        if !has_counter {
+            let sampler = gpu.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(20));
+                let mut last = Instant::now();
+                loop {
+                    interval.tick().await;
+                    let now = Instant::now();
+                    let dt = (now - last).as_secs_f64();
+                    last = now;
+                    let watts = sampler.power_mw() as f64 / 1000.0;
+                    if let Some(total) = &sampler.integrated_mj {
+                        *total.lock().unwrap() += watts * dt * 1000.0;
+                    }
+                }
+            });
+        }
+        Ok(gpu)
+    }
+
+    fn device(&self) -> Option<nvml_wrapper::Device<'_>> {
+        self.nvml.device_by_index(self.index).ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl EnergySource for NvmlGpu {
+    fn name(&self) -> &str {
+        &self.label
+    }
+
+    fn total_energy_mj(&self) -> u64 {
+        match &self.integrated_mj {
+            Some(total) => *total.lock().unwrap() as u64,
+            None => self
+                .device()
+                .and_then(|d| d.total_energy_consumption().ok())
+                .unwrap_or(0),
+        }
+    }
+
+    fn power_mw(&self) -> u64 {
+        self.device().and_then(|d| d.power_usage().ok()).unwrap_or(0) as u64
     }
 }

@@ -77,6 +77,11 @@ impl Stats {
         records.push_back(record);
     }
 
+    /// Every stored record, oldest first (for benchmark scripts).
+    pub fn all(&self) -> Vec<RequestRecord> {
+        self.records.lock().unwrap().iter().cloned().collect()
+    }
+
     pub fn summary(&self) -> Summary {
         let records = self.records.lock().unwrap();
         let avg = |values: Vec<f64>| {

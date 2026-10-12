@@ -10,8 +10,8 @@ using NVIDIA's NVML energy counters.
 client  ->  wattson (:8080)  ->  vLLM / SGLang / mock server (:8000)
 ```
 
-> Status: work in progress. Energy currently comes from a simulated GPU so the
-> gateway can be developed on any machine; real NVML readings come next.
+> Status: work in progress. Runs with a simulated GPU on any machine, and with
+> real NVIDIA NVML readings on Linux (e.g. a free Kaggle T4).
 
 ## Layout
 
@@ -23,6 +23,10 @@ client  ->  wattson (:8080)  ->  vLLM / SGLang / mock server (:8000)
 | `src/energy.rs` | `EnergySource` trait, phase tracking, and the simulated GPU |
 | `src/stats.rs` | In-memory per-request records and the `/stats` summary |
 | `src/bin/mock-server.rs` | Fake OpenAI-compatible server for development without a GPU |
+| `scripts/hf_server.py` | Baseline model server (Hugging Face transformers, one request at a time) |
+| `scripts/load_test.py` | Benchmark at several concurrency levels; writes `results/<label>.csv` |
+| `notebooks/wattson_kaggle.ipynb` | Runs everything on a free Kaggle GPU |
+| `results/` | Benchmark CSVs |
 
 ## What gets measured
 
@@ -74,6 +78,34 @@ as a 2.8× drop in energy per token.
 Check it yourself: `GET /energy` shows `ledger.attributed_j + ledger.idle_j`,
 which tracks `total_energy_j`.
 
+### Real GPUs: NVML
+
+With `WATTSON_ENERGY=nvml` (Linux only), Wattson reads GPU energy through
+NVML, the library behind `nvidia-smi`:
+
+- **Volta and newer (T4, A100, ...)**: the GPU's own cumulative energy
+  counter, in millijoules.
+- **Older GPUs (P100)**: no counter, so Wattson samples power every 20 ms and
+  integrates it.
+
+NVML power readings are averaged by the driver, so very short requests are
+measured less precisely than long ones.
+
+### Known limitation: queued requests
+
+The gateway can't see the model server's queue. Until a request's first token
+arrives, it counts as "prefill", even if it's really waiting behind other
+requests. With a server that runs one request at a time, waiting requests are
+therefore overcharged. The fix is to use the server's own queue metrics
+(vLLM exposes running vs waiting request counts).
+
+## Run on a free NVIDIA GPU (Kaggle)
+
+1. Create a Kaggle notebook: **File → Import Notebook**, and upload
+   `notebooks/wattson_kaggle.ipynb`.
+2. Settings: **Accelerator → GPU T4 x2**, **Internet → On**.
+3. Run all cells. Results land in `/kaggle/working/wattson/results/`.
+
 ## Try it
 
 Terminal 1, the fake inference server:
@@ -102,7 +134,8 @@ curl localhost:8080/energy
 |----------|---------|--|
 | `WATTSON_PORT` | `8080` | Gateway port |
 | `WATTSON_UPSTREAM` | `http://127.0.0.1:8000` | Inference server base URL |
-| `WATTSON_ENERGY` | `sim` | Energy source (`sim`; `nvml` coming) |
+| `WATTSON_ENERGY` | `sim` | Energy source: `sim` or `nvml` (Linux + NVIDIA GPU) |
+| `WATTSON_GPU_INDEX` | `0` | Which GPU NVML reads |
 | `MOCK_PREFILL_MS` | `50` | Mock server delay before the first token |
 | `MOCK_TOKEN_DELAY_MS` | `20` | Mock server delay per generated token |
 | `MOCK_PORT` | `8000` | Mock server port |
