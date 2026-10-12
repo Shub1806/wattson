@@ -25,7 +25,8 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use crate::{
-    energy::{Activity, EnergySource, Phase, PhaseGuard},
+    attribution::{Ledger, Meter},
+    energy::{Activity, EnergySource, Phase},
     stats::{RequestRecord, Stats},
 };
 
@@ -37,6 +38,7 @@ pub struct AppState {
     pub next_id: Arc<AtomicU64>,
     pub energy: Arc<dyn EnergySource>,
     pub activity: Arc<Activity>,
+    pub ledger: Arc<Ledger>,
 }
 
 /// Energy-counter reading taken when a request starts.
@@ -53,9 +55,9 @@ impl EnergyStart {
 
     /// Joules used by the *whole GPU* since this request started.
     ///
-    /// This is the naive measurement: it also includes idle power and any
-    /// other requests running at the same time. Splitting energy fairly
-    /// between concurrent requests is the next step.
+    /// This is the naive measurement: it also includes any other requests
+    /// running at the same time. Kept alongside the fair share (see
+    /// attribution.rs) so the two can be compared.
     fn joules_so_far(&self) -> f64 {
         self.source.total_energy_mj().saturating_sub(self.start_mj) as f64 / 1000.0
     }
@@ -90,12 +92,12 @@ pub async fn chat_completions(State(state): State<AppState>, Json(mut body): Jso
 
     let response_body = if stream && status.is_success() {
         // Streaming: we see the first token, so we know when prefill ends.
-        let phase = PhaseGuard::new(state.activity.clone(), Phase::Prefill);
-        stream_and_measure(upstream, id, start, energy, phase, state.stats)
+        let meter = Meter::start(state.ledger.clone(), state.activity.clone(), id, Phase::Prefill);
+        stream_and_measure(upstream, id, start, energy, meter, state.stats)
     } else {
         // Non-streaming: we can't see phases, so count it all as decode.
-        let _phase = PhaseGuard::new(state.activity.clone(), Phase::Decode);
-        buffer_and_measure(upstream, id, start, energy, stream, status, state.stats).await
+        let meter = Meter::start(state.ledger.clone(), state.activity.clone(), id, Phase::Decode);
+        buffer_and_measure(upstream, id, start, energy, meter, stream, status, state.stats).await
     };
 
     let mut response = Response::new(response_body);
@@ -113,6 +115,7 @@ async fn buffer_and_measure(
     id: u64,
     start: Instant,
     energy: EnergyStart,
+    mut meter: Meter,
     stream: bool,
     status: StatusCode,
     stats: Stats,
@@ -122,13 +125,14 @@ async fn buffer_and_measure(
         let usage = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v.get("usage").cloned());
         let get = |key: &str| usage.as_ref().and_then(|u| u.get(key)).and_then(Value::as_u64);
         let completion_tokens = get("completion_tokens").unwrap_or(0);
-        let energy_j = energy.joules_so_far();
+        let energy_j = meter.finish();
         stats.push(RequestRecord {
             id,
             stream,
             prompt_tokens: get("prompt_tokens"),
             completion_tokens,
             energy_j,
+            naive_energy_j: energy.joules_so_far(),
             joules_per_token: per_token(energy_j, completion_tokens),
             ttft_ms: None,
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -145,10 +149,10 @@ fn stream_and_measure(
     id: u64,
     start: Instant,
     energy: EnergyStart,
-    phase: PhaseGuard,
+    meter: Meter,
     stats: Stats,
 ) -> Body {
-    let tracker = Arc::new(Mutex::new(Tracker::new(id, start, energy, phase, stats)));
+    let tracker = Arc::new(Mutex::new(Tracker::new(id, start, energy, meter, stats)));
     let chunks = upstream.bytes_stream().map(move |chunk| {
         if let Ok(bytes) = &chunk {
             tracker.lock().unwrap().observe(bytes);
@@ -165,7 +169,7 @@ struct Tracker {
     id: u64,
     start: Instant,
     energy: EnergyStart,
-    phase: PhaseGuard,
+    meter: Meter,
     stats: Stats,
     /// Holds a partial line when an SSE event is split across network chunks.
     buffer: String,
@@ -178,12 +182,12 @@ struct Tracker {
 }
 
 impl Tracker {
-    fn new(id: u64, start: Instant, energy: EnergyStart, phase: PhaseGuard, stats: Stats) -> Self {
+    fn new(id: u64, start: Instant, energy: EnergyStart, meter: Meter, stats: Stats) -> Self {
         Self {
             id,
             start,
             energy,
-            phase,
+            meter,
             stats,
             buffer: String::new(),
             counted_tokens: 0,
@@ -228,7 +232,7 @@ impl Tracker {
             if self.first_token_at.is_none() {
                 // First token out: prefill is over, decode begins.
                 self.first_token_at = Some(now);
-                self.phase.enter(Phase::Decode);
+                self.meter.enter(Phase::Decode);
             }
             self.last_token_at = Some(now);
             self.counted_tokens += 1;
@@ -245,13 +249,14 @@ impl Drop for Tracker {
             }
             _ => None,
         };
-        let energy_j = self.energy.joules_so_far();
+        let energy_j = self.meter.finish();
         self.stats.push(RequestRecord {
             id: self.id,
             stream: true,
             prompt_tokens: self.usage_prompt,
             completion_tokens: tokens,
             energy_j,
+            naive_energy_j: self.energy.joules_so_far(),
             joules_per_token: per_token(energy_j, tokens),
             ttft_ms: self.first_token_at.map(|t| (t - self.start).as_secs_f64() * 1000.0),
             total_ms: self.start.elapsed().as_secs_f64() * 1000.0,

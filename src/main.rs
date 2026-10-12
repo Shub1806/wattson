@@ -12,6 +12,7 @@
 //!   WATTSON_UPSTREAM   inference server base URL    (default http://127.0.0.1:8000)
 //!   WATTSON_ENERGY     energy source: "sim"         (default sim; "nvml" comes later)
 
+mod attribution;
 mod energy;
 mod proxy;
 mod stats;
@@ -28,6 +29,7 @@ use axum::{
     Json, Router,
 };
 
+use attribution::{Ledger, LedgerTotals};
 use energy::{Activity, EnergySource, SimulatedGpu};
 use proxy::AppState;
 use serde::Serialize;
@@ -48,6 +50,8 @@ struct EnergyStatus {
     total_energy_j: f64,
     requests_prefilling: i64,
     requests_decoding: i64,
+    /// How the GPU's energy has been split since the gateway started.
+    ledger: LedgerTotals,
 }
 
 async fn energy_handler(State(state): State<AppState>) -> Json<EnergyStatus> {
@@ -57,6 +61,7 @@ async fn energy_handler(State(state): State<AppState>) -> Json<EnergyStatus> {
         total_energy_j: state.energy.total_energy_mj() as f64 / 1000.0,
         requests_prefilling: state.activity.prefilling(),
         requests_decoding: state.activity.decoding(),
+        ledger: state.ledger.totals(),
     })
 }
 
@@ -74,6 +79,8 @@ async fn main() {
         Ok(other) => panic!("unknown WATTSON_ENERGY={other:?} (supported: sim)"),
     };
 
+    let ledger = Ledger::start(energy.clone());
+
     let state = AppState {
         client: reqwest::Client::new(),
         upstream: upstream.clone(),
@@ -81,6 +88,7 @@ async fn main() {
         next_id: Arc::new(AtomicU64::new(1)),
         energy: energy.clone(),
         activity,
+        ledger,
     };
 
     let app = Router::new()
