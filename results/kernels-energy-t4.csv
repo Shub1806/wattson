@@ -1,0 +1,6 @@
+implementation,rows,hidden,avg_power_w,mj_per_call,mj_per_call_above_idle,idle_w
+pytorch-eager,4096,4096,67.0,218.967,133.488,26.2
+pytorch-rms_norm,4096,4096,68.3,53.36,32.916,26.2
+cuda-scalar,4096,4096,70.5,41.607,26.173,26.2
+cuda-half2,4096,4096,70.7,41.695,26.258,26.2
+triton,4096,4096,68.3,39.806,24.557,26.2
