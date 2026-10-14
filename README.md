@@ -27,6 +27,11 @@ client  ->  wattson (:8080)  ->  vLLM / SGLang / mock server (:8000)
 | `scripts/load_test.py` | Benchmark at several concurrency levels; writes `results/<label>.csv` |
 | `notebooks/wattson_kaggle.ipynb` | First real-GPU run: baseline server on a Kaggle T4 |
 | `notebooks/wattson_vllm.ipynb` | Baseline vs vLLM, same GPU and model |
+| `kernels/fused_add_rmsnorm.cu` | Fused residual-add + RMSNorm in CUDA (scalar and `half2`-vectorized) |
+| `kernels/rmsnorm_triton.py` | The same kernel in Triton |
+| `kernels/bench.py` | Correctness, time, bandwidth and energy: PyTorch vs CUDA vs Triton |
+| `kernels/roofline.py` | Roofline model of the T4, applied to the measured decode speed |
+| `notebooks/wattson_kernels.ipynb` | Runs the kernel benchmark on a Kaggle T4 |
 | `results/` | Benchmark CSVs |
 
 ## What gets measured
@@ -160,6 +165,53 @@ kernels are compiled the first time they see a new batch shape, and the first
 round at that level paid for it. `load_test.py` now runs an unrecorded
 warm-up round per level (`--warmup`, default 1) to keep this out of the
 measurements.
+
+## Roofline: why is decode slow?
+
+![Roofline for the Tesla T4](results/roofline-t4.png)
+
+A kernel is capped by compute (65 TFLOPS FP16 on the T4) or by memory
+bandwidth (320 GB/s), depending on its *arithmetic intensity*: FLOPs per byte
+moved. The ridge point is 65e12 / 320e9 ≈ **203 FLOP/byte**.
+
+- **Decode is memory-bound.** A linear layer applied to a batch of B tokens
+  reads every weight once and does ~B FLOPs per byte, so decode sits far
+  left of the ridge until the batch reaches ~200. That is why adding
+  sequences to a batch costs almost nothing.
+- **Prefill is compute-bound.** 2048 prompt tokens give ~370 FLOP/byte,
+  past the ridge.
+- **RMSNorm is extremely memory-bound** (~0.6 FLOP/byte), so its only
+  possible optimization is moving fewer bytes, which is what fusion does.
+
+**The measured decode speed is 10× slower than the memory roof.** Each decode
+step of Qwen2.5-0.5B must read 0.99 GB of weights, so at 320 GB/s a step takes
+at least 3.1 ms (≤ 324 tokens/s per sequence). vLLM measured ~32 tokens/s per
+sequence, about 31 ms per step, at *every* batch size from 1 to 16. So the
+bottleneck is neither compute nor memory: it's the fixed cost of launching
+hundreds of small kernels per step in eager mode. Batching shares that fixed
+cost across sequences, which is exactly why energy per token fell 13× while
+per-sequence speed stayed flat. (Next experiment: CUDA graphs, i.e. vLLM
+without `--enforce-eager`, which remove most of that launch overhead.)
+
+## GPU kernel: fused residual-add + RMSNorm
+
+Every Llama/Qwen block runs `h = x + residual; out = RMSNorm(h) * weight`
+twice per layer. PyTorch eager runs it as ~6 kernels, each a full pass over
+GPU memory. Fused, each element is read once and written once. Since the
+kernel is memory-bound, the score that matters is **achieved bandwidth as a
+percentage of the 320 GB/s peak**.
+
+Implementations compared in `kernels/bench.py`:
+
+| Name | What it is |
+|------|------------|
+| `pytorch-eager` | The naive PyTorch expression (several kernels) |
+| `pytorch-rms_norm` | Separate add, then PyTorch's built-in `F.rms_norm` |
+| `cuda-scalar` | Hand-written CUDA, one fp16 value per load, warp-shuffle reduction |
+| `cuda-half2` | Same, but loads two fp16 values per instruction |
+| `triton` | Triton version; the compiler picks vectorization and layout |
+
+Results on a Tesla T4: *(run `notebooks/wattson_kernels.ipynb`)*
 
 ## Try it
 
