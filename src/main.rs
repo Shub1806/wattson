@@ -103,10 +103,12 @@ async fn main() {
         }
     };
 
+    let client = reqwest::Client::new();
     let ledger = Ledger::start(energy.clone());
+    ledger.watch_server_queue(client.clone(), upstream.clone());
 
     let state = AppState {
-        client: reqwest::Client::new(),
+        client,
         upstream: upstream.clone(),
         stats: Stats::default(),
         next_id: Arc::new(AtomicU64::new(1)),

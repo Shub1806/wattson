@@ -10,6 +10,7 @@ Only standard library + torch + transformers, which Kaggle already has.
 
 Endpoints:
     GET  /health
+    GET  /metrics               (queue length, vLLM metric names)
     POST /v1/chat/completions   (stream, max_tokens, stream_options.include_usage,
                                  ignore_eos for fixed-length benchmarks)
 """
@@ -36,6 +37,28 @@ model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=DTYPE).to(DEVICE
 # One request on the GPU at a time. Others wait here, which shows up as a
 # longer time-to-first-token for them.
 gpu_lock = threading.Lock()
+
+# Queue counters, published at /metrics with the same names vLLM uses, so
+# Wattson can tell waiting requests from running ones.
+counts_lock = threading.Lock()
+counts = {"waiting": 0, "running": 0}
+
+
+class gpu_slot:
+    """`with gpu_slot():` waits for the GPU and keeps the queue counters right."""
+
+    def __enter__(self):
+        with counts_lock:
+            counts["waiting"] += 1
+        gpu_lock.acquire()
+        with counts_lock:
+            counts["waiting"] -= 1
+            counts["running"] += 1
+
+    def __exit__(self, *exc):
+        with counts_lock:
+            counts["running"] -= 1
+        gpu_lock.release()
 
 
 def build_inputs(messages):
@@ -77,6 +100,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send(200, b"ok", "text/plain")
+        elif self.path == "/metrics":
+            with counts_lock:
+                text = (f"vllm:num_requests_waiting {counts['waiting']}\n"
+                        f"vllm:num_requests_running {counts['running']}\n")
+            self._send(200, text.encode(), "text/plain")
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -92,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
     def _complete(self, body):
         inputs = build_inputs(body.get("messages", []))
         prompt_len = inputs["input_ids"].shape[1]
-        with gpu_lock, torch.no_grad():
+        with gpu_slot(), torch.no_grad():
             output = model.generate(**generation_kwargs(inputs, body))
         new_tokens = output[0][prompt_len:]
         response = {
@@ -129,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         try:
-            with gpu_lock:
+            with gpu_slot():
                 worker = threading.Thread(target=run)
                 worker.start()
                 for text in streamer:

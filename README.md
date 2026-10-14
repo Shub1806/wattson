@@ -25,7 +25,8 @@ client  ->  wattson (:8080)  ->  vLLM / SGLang / mock server (:8000)
 | `src/bin/mock-server.rs` | Fake OpenAI-compatible server for development without a GPU |
 | `scripts/hf_server.py` | Baseline model server (Hugging Face transformers, one request at a time) |
 | `scripts/load_test.py` | Benchmark at several concurrency levels; writes `results/<label>.csv` |
-| `notebooks/wattson_kaggle.ipynb` | Runs everything on a free Kaggle GPU |
+| `notebooks/wattson_kaggle.ipynb` | First real-GPU run: baseline server on a Kaggle T4 |
+| `notebooks/wattson_vllm.ipynb` | Baseline vs vLLM, same GPU and model |
 | `results/` | Benchmark CSVs |
 
 ## What gets measured
@@ -91,20 +92,45 @@ NVML, the library behind `nvidia-smi`:
 NVML power readings are averaged by the driver, so very short requests are
 measured less precisely than long ones.
 
-### Known limitation: queued requests
+### Queued requests
 
-The gateway can't see the model server's queue. Until a request's first token
-arrives, it counts as "prefill", even if it's really waiting behind other
-requests. With a server that runs one request at a time, waiting requests are
-therefore overcharged. The fix is to use the server's own queue metrics
-(vLLM exposes running vs waiting request counts).
+Until a request's first token arrives, the gateway can't tell whether it is
+really prefilling or just waiting in the server's queue. On a server that
+runs one request at a time, treating all of them as "prefill" overcharged
+waiting requests heavily.
+
+So Wattson polls the server's `/metrics` for `vllm:num_requests_waiting`
+(vLLM publishes it; `scripts/hf_server.py` publishes the same metric). If N
+of the M not-yet-started requests are waiting, each of the M gets
+(M − N) / M of the prefill weight. Requests that arrive together can reach
+the server in any order, so this splits fairly *on average* rather than
+guessing which one started.
 
 ## Run on a free NVIDIA GPU (Kaggle)
 
 1. Create a Kaggle notebook: **File → Import Notebook**, and upload
-   `notebooks/wattson_kaggle.ipynb`.
+   `notebooks/wattson_vllm.ipynb`.
 2. Settings: **Accelerator → GPU T4 x2**, **Internet → On**.
 3. Run all cells. Results land in `/kaggle/working/wattson/results/`.
+
+## Results on a Tesla T4
+
+First run, `results/hf-serial-t4.csv` (baseline server, one request at a
+time, Qwen2.5-0.5B-Instruct FP16, 128 tokens per request):
+
+| Concurrent requests | J/token | Mean TTFT | Total tok/s |
+|--------------------:|--------:|----------:|------------:|
+| 1 | 1.314 | 94 ms | 25.1 |
+| 2 | 1.324 | 2,625 ms | 25.2 |
+| 4 | 1.336 | 7,584 ms | 25.5 |
+
+- **No gain from concurrency**: requests just wait in line, so TTFT grows
+  and throughput stays flat.
+- **The GPU is mostly idle**: it draws 26.9 W at rest and about 33.5 W while
+  generating (1.31 J/token × 25.5 tok/s). Only ~20% of the energy goes to
+  producing tokens; the rest is the idle baseline. One token at a time from
+  a 0.5B model is bound by Python and kernel-launch overhead, not by compute
+  or memory bandwidth.
 
 ## Try it
 

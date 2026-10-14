@@ -16,6 +16,7 @@ import os
 import statistics
 import threading
 import time
+import urllib.error
 import urllib.request
 
 PROMPT = "Explain in detail how a GPU executes a matrix multiplication."
@@ -26,9 +27,9 @@ def get(url):
         return json.loads(resp.read())
 
 
-def send_request(gateway, max_tokens, ids, errors):
+def send_request(gateway, model, max_tokens, ids, errors):
     body = json.dumps({
-        "model": "any",
+        "model": model,
         "stream": True,
         "max_tokens": max_tokens,
         "ignore_eos": True,  # fixed output length makes runs comparable
@@ -41,6 +42,8 @@ def send_request(gateway, max_tokens, ids, errors):
             ids.append(int(resp.headers["x-wattson-request-id"]))
             for _ in resp:  # read the whole stream
                 pass
+    except urllib.error.HTTPError as err:  # e.g. wrong model name
+        errors.append(f"HTTP {err.code}: {err.read()[:200].decode(errors='replace')}")
     except Exception as err:  # keep going; report at the end
         errors.append(str(err))
 
@@ -49,6 +52,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway", default="http://127.0.0.1:8080")
     parser.add_argument("--label", required=True, help="name for this run, e.g. hf-serial")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct",
+                        help="model name; vLLM rejects requests for any other name")
     parser.add_argument("--concurrency", default="1,2,4")
     parser.add_argument("--waves", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
@@ -70,7 +75,7 @@ def main():
         for wave in range(args.waves):
             ids, errors = [], []
             threads = [threading.Thread(target=send_request,
-                                        args=(args.gateway, args.max_tokens, ids, errors))
+                                        args=(args.gateway, args.model, args.max_tokens, ids, errors))
                        for _ in range(level)]
             for t in threads:
                 t.start()
