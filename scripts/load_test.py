@@ -57,6 +57,8 @@ def main():
     parser.add_argument("--concurrency", default="1,2,4")
     parser.add_argument("--waves", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="unrecorded rounds per level first (lets kernels compile for new batch sizes)")
     parser.add_argument("--out-dir", default="results")
     args = parser.parse_args()
 
@@ -71,6 +73,14 @@ def main():
     level_of = {}  # request id -> concurrency level
     wall = {}
     for level in [int(c) for c in args.concurrency.split(",")]:
+        for _ in range(args.warmup):  # not recorded: absorbs one-time compile/warm-up costs
+            threads = [threading.Thread(target=send_request,
+                                        args=(args.gateway, args.model, args.max_tokens, [], []))
+                       for _ in range(level)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
         start = time.time()
         for wave in range(args.waves):
             ids, errors = [], []

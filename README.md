@@ -115,22 +115,51 @@ guessing which one started.
 
 ## Results on a Tesla T4
 
-First run, `results/hf-serial-t4.csv` (baseline server, one request at a
-time, Qwen2.5-0.5B-Instruct FP16, 128 tokens per request):
+Same GPU (Kaggle Tesla T4), same model (Qwen2.5-0.5B-Instruct, FP16), same
+benchmark: N simultaneous requests, 128 output tokens each, 3 rounds per
+level. Energy from the T4's hardware energy counter via NVML, split per
+request by Wattson. Data: `results/hf-t4.csv`, `results/vllm-t4.csv`.
 
-| Concurrent requests | J/token | Mean TTFT | Total tok/s |
-|--------------------:|--------:|----------:|------------:|
-| 1 | 1.314 | 94 ms | 25.1 |
-| 2 | 1.324 | 2,625 ms | 25.2 |
-| 4 | 1.336 | 7,584 ms | 25.5 |
+| Concurrent requests | Baseline J/token | vLLM J/token | Baseline tok/s | vLLM tok/s |
+|--------------------:|-----------------:|-------------:|---------------:|-----------:|
+| 1  | 1.362 | 1.339 | 25.3 | 27.6 |
+| 2  | 1.305 | 0.628 | 27.0 | 58.6 |
+| 4  | 1.338 | 0.280 | 27.3 | 137.0 |
+| 8  | –     | 0.246 | –    | 146.8 |
+| 16 | –     | **0.101** | – | **461.6** |
 
-- **No gain from concurrency**: requests just wait in line, so TTFT grows
-  and throughput stays flat.
-- **The GPU is mostly idle**: it draws 26.9 W at rest and about 33.5 W while
-  generating (1.31 J/token × 25.5 tok/s). Only ~20% of the energy goes to
-  producing tokens; the rest is the idle baseline. One token at a time from
-  a 0.5B model is bound by Python and kernel-launch overhead, not by compute
-  or memory bandwidth.
+Baseline = Hugging Face `transformers`, one request at a time. vLLM 0.18.0 =
+continuous batching (Triton attention, eager mode).
+
+### What the numbers say
+
+- **Batching cuts energy per token 13×.** With a single request, vLLM is no
+  better than the baseline: a 0.5B model generating one token at a time is
+  bound by per-step overhead, not by the GPU. With 16 concurrent requests,
+  vLLM reaches 461 tok/s at 0.10 J/token.
+- **Extra requests are nearly free.** Each vLLM request decodes at ~33 tok/s
+  whether 1 or 16 run together. A decode step reads all the weights from
+  memory once regardless of batch size, so one step can serve many
+  sequences at almost the same cost: decode is memory-bound, and batching
+  amortizes the memory traffic.
+- **The idle floor dominates small workloads.** The T4 draws ~27–31 W doing
+  nothing. The serial baseline averaged ~34 W while generating, so ~80% of
+  its energy was the idle floor. vLLM at 16 concurrent requests averaged
+  ~47 W (0.101 J/token × 461.6 tok/s), still well under the 70 W limit.
+- **The baseline doesn't scale.** More concurrent requests only add queueing:
+  mean time to first token rose from 0.4 s to 7.2 s while throughput stayed
+  flat at ~27 tok/s.
+- **Reproducible.** Two separate baseline runs (`hf-serial-t4.csv` and
+  `hf-t4.csv`, different sessions) agree within ~4% on J/token.
+
+### Anomaly: concurrency 8
+
+At 8 concurrent requests vLLM's mean TTFT was 2,957 ms and throughput only
+147 tok/s, worse than at 16. The likely cause is one-time warm-up: Triton
+kernels are compiled the first time they see a new batch shape, and the first
+round at that level paid for it. `load_test.py` now runs an unrecorded
+warm-up round per level (`--warmup`, default 1) to keep this out of the
+measurements.
 
 ## Try it
 
