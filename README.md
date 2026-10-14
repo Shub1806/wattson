@@ -2,16 +2,38 @@
 
 **How many joules did that LLM request cost?**
 
-Wattson is a small Rust gateway that sits in front of an LLM inference server
-(vLLM / SGLang) and attributes GPU energy and cost to each individual request,
-using NVIDIA's NVML energy counters.
+Wattson is a small Rust gateway that sits in front of an OpenAI-compatible LLM
+inference server (tested with vLLM and a Hugging Face baseline) and attributes
+GPU energy to each individual request, using NVIDIA's NVML energy counter.
+Alongside it: a fused RMSNorm kernel in CUDA and Triton, and a roofline
+analysis that explains the measurements.
 
 ```
-client  ->  wattson (:8080)  ->  vLLM / SGLang / mock server (:8000)
+client  ->  wattson (:8080)  ->  vLLM / HF baseline / mock server (:8000)
+                 |
+                 └── NVML energy counter, split per request every 20 ms
 ```
 
-> Status: work in progress. Runs with a simulated GPU on any machine, and with
-> real NVIDIA NVML readings on Linux (e.g. a free Kaggle T4).
+Runs with a simulated GPU on any machine (including a Mac), and with real NVML
+readings on Linux. All GPU results below come from a free Kaggle Tesla T4.
+
+## Highlights
+
+- **Per-request energy, fairly split.** Naive "energy at end minus energy at
+  start" overcharged concurrent requests 4×. Wattson splits each 20 ms slice
+  of GPU energy between active requests by phase, and uses the server's queue
+  metrics so waiting requests aren't charged for others' work. Every joule is
+  counted exactly once.
+- **Batching cuts energy per token 13×.** Same T4, same model: a serial
+  baseline stays at ~1.3 J/token at any load; vLLM falls to **0.10 J/token**
+  at 16 concurrent requests (461 tok/s).
+- **Decode is 10× slower than the memory roofline.** Reading 0.99 GB of
+  weights takes 3.1 ms; measured steps take ~31 ms at every batch size. The
+  bottleneck is kernel-launch overhead, which is exactly what batching
+  amortizes.
+- **Fused kernel: 5.6× faster, 5.5× less energy.** Hand-written CUDA and
+  Triton fused add + RMSNorm reach ~71% of the T4's peak bandwidth, against
+  13% for PyTorch eager.
 
 ## Layout
 
@@ -113,8 +135,9 @@ guessing which one started.
 
 ## Run on a free NVIDIA GPU (Kaggle)
 
-1. Create a Kaggle notebook: **File → Import Notebook**, and upload
-   `notebooks/wattson_vllm.ipynb`.
+1. Create a Kaggle notebook: **File → Import Notebook**, and upload one of:
+   - `notebooks/wattson_vllm.ipynb`: baseline vs vLLM, energy per token (~20 min)
+   - `notebooks/wattson_kernels.ipynb`: kernel benchmark and roofline (~10 min)
 2. Settings: **Accelerator → GPU T4 x2**, **Internet → On**.
 3. Run all cells. Results land in `/kaggle/working/wattson/results/`.
 
@@ -211,7 +234,60 @@ Implementations compared in `kernels/bench.py`:
 | `cuda-half2` | Same, but loads two fp16 values per instruction |
 | `triton` | Triton version; the compiler picks vectorization and layout |
 
-Results on a Tesla T4: *(run `notebooks/wattson_kernels.ipynb`)*
+Results on a Tesla T4 (`results/kernels-t4.csv`), all implementations
+verified against a float32 reference:
+
+| Shape (rows × hidden) | PyTorch eager | PyTorch `rms_norm` | CUDA scalar | CUDA `half2` | Triton |
+|---|---:|---:|---:|---:|---:|
+| 1 × 4096 (decode, 1 seq) | 28.0 µs | 11.0 µs | 11.0 µs | 7.9 µs | **5.4 µs** |
+| 16 × 4096 (decode, 16 seqs) | 37.4 µs | 12.9 µs | 11.7 µs | 8.6 µs | **6.4 µs** |
+| 256 × 4096 | 216.7 µs | 42.4 µs | 42.7 µs | 40.2 µs | **38.8 µs** |
+| 4096 × 4096 (prefill-sized) | 3281.7 µs | 790.9 µs | 592.0 µs | 589.8 µs | **586.5 µs** |
+| % of peak bandwidth at 4096 × 4096 | 12.8% | 53.0% | 70.9% | 71.1% | 71.5% |
+
+Energy per call at 4096 × 4096 (`results/kernels-energy-t4.csv`), from the
+NVML energy counter over ~3 s of back-to-back calls, idle 26.2 W:
+
+| | PyTorch eager | PyTorch `rms_norm` | CUDA scalar | CUDA `half2` | Triton |
+|---|---:|---:|---:|---:|---:|
+| Energy per call | 219.0 mJ | 53.4 mJ | 41.6 mJ | 41.7 mJ | **39.8 mJ** |
+| Average power | 67.0 W | 68.3 W | 70.5 W | 70.7 W | 68.3 W |
+
+### What the kernel numbers say
+
+- **Fusion is the win.** At large sizes all three fused kernels are 5.6×
+  faster than eager PyTorch and use 5.5× less energy per call, because they
+  move each byte once instead of ~6 times.
+- **~71% of peak is the practical ceiling.** All fused kernels land at
+  227–229 GB/s of the T4's 320 GB/s datasheet figure; real GDDR6 rarely
+  sustains much more. Once a kernel is there, vectorized `half2` loads add
+  nothing, because the memory system is already saturated.
+- **Small batches are a different problem.** At 1–16 rows the hand-written
+  CUDA is up to 2× slower than Triton. It assigns one thread block per row, so
+  16 rows occupy only 16 of the T4's 40 streaming multiprocessors, and each
+  block has little work to hide memory latency. Triton puts more warps on
+  each row. `half2` helps here (11.7 → 8.6 µs) because fewer, wider loads
+  mean fewer memory instructions waiting in line. The fix for the CUDA
+  version would be splitting each row across several warps.
+- **At decode sizes, launch overhead dominates.** A single row takes 5–60 µs
+  and uses under 2.5% of bandwidth: the cost is launching the kernel, not
+  moving data. This is the same bottleneck the roofline found in vLLM decode,
+  seen at the level of one kernel.
+- **Memory-bound work runs at the power limit.** These kernels drew 67–71 W,
+  the T4's 70 W cap, while LLM decode with vLLM averaged ~47 W.
+
+## Limitations and next steps
+
+- **Single GPU, small model.** All results are from one T4 and a 0.5B model;
+  bigger models move decode closer to the memory roof and change the balance.
+- **NVML granularity.** The energy counter is read every 20 ms and the
+  driver averages power internally, so very short requests are measured less
+  precisely than long ones.
+- **Phase weights are assumed.** Prefill is weighted 4× decode; measuring the
+  actual prefill vs decode power on the GPU would calibrate this.
+- **CUDA graphs.** vLLM ran in eager mode for reliability on the T4. Running
+  without `--enforce-eager` should cut the launch overhead that dominates
+  decode; Wattson can measure how much energy that saves.
 
 ## Try it
 
